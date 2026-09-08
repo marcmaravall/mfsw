@@ -30,6 +30,7 @@ struct event {
     action type = action::NONE;
     std::filesystem::path directory;
     std::filesystem::path filename;
+    std::filesystem::path old_directory;
     std::filesystem::path old_filename;
 };
 
@@ -161,6 +162,7 @@ void file_watcher::run(entry& e) {
                 event ev{action::MOVE, dir, name, {}};
                 auto pm = pending_moves.find(raw->cookie);
                 if (pm != pending_moves.end()) {
+                    ev.old_directory = pm->second.directory;
                     ev.old_filename = pm->second.filename;
                     pending_moves.erase(pm);
                 }
