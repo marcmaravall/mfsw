@@ -11,7 +11,7 @@
 #include <vector>
 
 #ifdef _WIN32
-#error "Win32 Is not supported yet"
+#include <windows.h>
 #endif
 #ifdef __linux__
 #include <poll.h>
@@ -24,7 +24,7 @@
 
 namespace mfsw {
 
-enum class action { NONE, ADD, DELETE, MOVE, MODIFY };
+enum class action { NONE, ADD, REMOVE, MOVE, MODIFY };
 
 struct event {
     action type = action::NONE;
@@ -60,7 +60,10 @@ private:
     std::vector<std::thread> m_threads;
     std::atomic<bool> m_running{false};
 
-#ifdef __linux__
+#ifdef _WIN32
+    HANDLE m_stop_event = nullptr;
+    void run(entry& e);
+#elif defined(__linux__)
     int m_stop_fd = -1;
     void run(entry& e);
 #endif
@@ -84,12 +87,152 @@ public:
 
 namespace mfsw {
 
-#ifdef __linux__
+void file_watcher::watch() {
+    m_running = true;
+#ifdef _WIN32
+    m_stop_event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+#elif defined(__linux__)
+    m_stop_fd = eventfd(0, EFD_NONBLOCK);
+#endif
+
+    for (auto& e : m_entries) {
+        m_threads.emplace_back([this, &e]() { run(e); });
+    }
+}
+
+void file_watcher::stop() {
+    if (!m_running.exchange(false)) return;
+
+#ifdef _WIN32
+    if (m_stop_event) SetEvent(m_stop_event);
+#elif defined(__linux__)
+    if (m_stop_fd >= 0) {
+        uint64_t one = 1;
+        write(m_stop_fd, &one, sizeof(one));
+    }
+#endif
+
+    for (auto& t : m_threads) {
+        if (t.joinable()) t.join();
+    }
+    m_threads.clear();
+
+#ifdef _WIN32
+    if (m_stop_event) {
+        CloseHandle(m_stop_event);
+        m_stop_event = nullptr;
+    }
+#elif defined(__linux__)
+    if (m_stop_fd >= 0) {
+        close(m_stop_fd);
+        m_stop_fd = -1;
+    }
+#endif
+}
 
 void file_watcher::add_listener(const std::filesystem::path& path,
                                 watch_listener* listener, bool recursive) {
     m_entries.push_back(entry(path, listener, recursive));
 }
+
+#ifdef _WIN32
+
+void file_watcher::run(entry& e) {
+    HANDLE hDir =
+        CreateFileW(e.path.c_str(), FILE_LIST_DIRECTORY,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                    nullptr, OPEN_EXISTING,
+                    FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OVERLAPPED, nullptr);
+
+    if (hDir == INVALID_HANDLE_VALUE) return;
+
+    constexpr DWORD notify_filter =
+        FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_DIR_NAME |
+        FILE_NOTIFY_CHANGE_LAST_WRITE | FILE_NOTIFY_CHANGE_CREATION;
+
+    constexpr DWORD buffer_size = 64 * 1024;
+    std::vector<BYTE> buffer(buffer_size);
+    OVERLAPPED overlapped{};
+    overlapped.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (!overlapped.hEvent) {
+        CloseHandle(hDir);
+        return;
+    }
+    HANDLE handles[2] = {overlapped.hEvent, m_stop_event};
+    event pending_rename;
+    bool have_pending_rename = false;
+    while (m_running) {
+        DWORD bytes_returned = 0;
+        BOOL ok = ReadDirectoryChangesW(hDir, buffer.data(), buffer_size,
+                                        e.recursive, notify_filter,
+                                        &bytes_returned, &overlapped, nullptr);
+        if (!ok) break;
+
+        DWORD wait_result = WaitForMultipleObjects(2, handles, FALSE, INFINITE);
+        if (wait_result == WAIT_OBJECT_0 + 1) {
+            CancelIoEx(hDir, &overlapped);
+            GetOverlappedResult(hDir, &overlapped, &bytes_returned, TRUE);
+            break;
+        }
+        if (wait_result != WAIT_OBJECT_0) continue;
+
+        DWORD transferred = 0;
+        if (!GetOverlappedResult(hDir, &overlapped, &transferred, FALSE) ||
+            transferred == 0) {
+            ResetEvent(overlapped.hEvent);
+            continue;
+        }
+        ResetEvent(overlapped.hEvent);
+
+        BYTE* ptr = buffer.data();
+        while (true) {
+            auto* info = reinterpret_cast<FILE_NOTIFY_INFORMATION*>(ptr);
+
+            std::wstring wname(info->FileName,
+                               info->FileNameLength / sizeof(WCHAR));
+            std::filesystem::path name(wname);
+
+            switch (info->Action) {
+                case FILE_ACTION_ADDED:
+                    e.listener->on_event(
+                        event{action::ADD, e.path, name, {}, {}});
+                    break;
+                case FILE_ACTION_REMOVED:
+                    e.listener->on_event(
+                        event{action::REMOVE, e.path, name, {}, {}});
+                    break;
+                case FILE_ACTION_MODIFIED:
+                    e.listener->on_event(
+                        event{action::MODIFY, e.path, name, {}, {}});
+                    break;
+                case FILE_ACTION_RENAMED_OLD_NAME:
+                    pending_rename = event{action::MOVE, {}, {}, e.path, name};
+                    have_pending_rename = true;
+                    break;
+                case FILE_ACTION_RENAMED_NEW_NAME: {
+                    event ev{action::MOVE, e.path, name, {}, {}};
+                    if (have_pending_rename) {
+                        ev.old_directory = pending_rename.old_directory;
+                        ev.old_filename = pending_rename.old_filename;
+                        have_pending_rename = false;
+                    }
+                    e.listener->on_event(ev);
+                    break;
+                }
+                default:
+                    break;
+            }
+
+            if (info->NextEntryOffset == 0) break;
+            ptr += info->NextEntryOffset;
+        }
+    }
+
+    CloseHandle(overlapped.hEvent);
+    CloseHandle(hDir);
+}
+
+#elif defined(__linux__)
 
 void file_watcher::run(entry& e) {
     int fd = inotify_init1(IN_NONBLOCK);
@@ -176,7 +319,7 @@ void file_watcher::run(entry& e) {
             if (raw->mask & IN_CREATE)
                 act = action::ADD;
             else if (raw->mask & (IN_DELETE | IN_DELETE_SELF))
-                act = action::DELETE;
+                act = action::REMOVE;
             else if (raw->mask & (IN_MODIFY | IN_CLOSE_WRITE))
                 act = action::MODIFY;
             if (act == action::NONE) continue;
@@ -192,33 +335,6 @@ void file_watcher::run(entry& e) {
 
     for (auto& [wd, path] : wd_to_path) inotify_rm_watch(fd, wd);
     close(fd);
-}
-
-void file_watcher::watch() {
-    m_running = true;
-    m_stop_fd = eventfd(0, EFD_NONBLOCK);
-
-    for (auto& e : m_entries) {
-        m_threads.emplace_back([this, &e]() { run(e); });
-    }
-}
-
-void file_watcher::stop() {
-    if (!m_running.exchange(false)) return;
-
-    if (m_stop_fd >= 0) {
-        uint64_t one = 1;
-        write(m_stop_fd, &one, sizeof(one));
-    }
-    for (auto& t : m_threads) {
-        if (t.joinable()) t.join();
-    }
-    m_threads.clear();
-
-    if (m_stop_fd >= 0) {
-        close(m_stop_fd);
-        m_stop_fd = -1;
-    }
 }
 
 #endif  // __linux__
