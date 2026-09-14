@@ -32,6 +32,7 @@ struct event {
     std::filesystem::path filename;
     std::filesystem::path old_directory;
     std::filesystem::path old_filename;
+    bool is_directory = false;
 };
 
 class watch_listener {
@@ -137,6 +138,7 @@ void file_watcher::add_listener(const std::filesystem::path& path,
 
 #ifdef _WIN32
 
+// TODO: detect is_directory and handle it properly
 void file_watcher::run(entry& e) {
     HANDLE hDir =
         CreateFileW(e.path.c_str(), FILE_LIST_DIRECTORY,
@@ -281,6 +283,7 @@ void file_watcher::run(entry& e) {
         ssize_t i = 0;
         while (i < len) {
             auto* raw = reinterpret_cast<inotify_event*>(buffer + i);
+            bool is_dir = raw->mask & IN_ISDIR;
             i += sizeof(inotify_event) + raw->len;
 
             if (raw->mask & IN_IGNORED) {
@@ -297,23 +300,32 @@ void file_watcher::run(entry& e) {
             std::filesystem::path full = dir / name;
 
             if (raw->mask & IN_MOVED_FROM) {
-                pending_moves[raw->cookie] = event{action::MOVE, dir, name, {}};
+                pending_moves[raw->cookie] = event{.type = action::MOVE,
+                                                   .directory = dir,
+                                                   .filename = name,
+                                                   .is_directory = is_dir};
                 continue;
             }
 
             if (raw->mask & IN_MOVED_TO) {
-                event ev{action::MOVE, dir, name, {}};
+                event ev{.type = action::MOVE,
+                         .directory = dir,
+                         .filename = name,
+                         .is_directory = is_dir};
                 auto pm = pending_moves.find(raw->cookie);
                 if (pm != pending_moves.end()) {
                     ev.old_directory = pm->second.directory;
                     ev.old_filename = pm->second.filename;
                     pending_moves.erase(pm);
                 }
-                if (e.recursive && std::filesystem::is_directory(full))
-                    add_watch(full);
+                if (e.recursive && is_dir) add_watch(full);
                 e.listener->on_event(ev);
                 continue;
             }
+            e.listener->on_event(event{.type = act,
+                                       .directory = dir,
+                                       .filename = name,
+                                       .is_directory = is_dir});
 
             action act = action::NONE;
             if (raw->mask & IN_CREATE)
@@ -329,7 +341,10 @@ void file_watcher::run(entry& e) {
                 add_watch(full);
             }
 
-            e.listener->on_event(event{act, dir, name, {}});
+            e.listener->on_event(event{.type = act,
+                                       .directory = dir,
+                                       .filename = name,
+                                       .is_directory = is_dir});
         }
     }
 
