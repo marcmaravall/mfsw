@@ -322,10 +322,6 @@ void file_watcher::run(entry& e) {
                 e.listener->on_event(ev);
                 continue;
             }
-            e.listener->on_event(event{.type = act,
-                                       .directory = dir,
-                                       .filename = name,
-                                       .is_directory = is_dir});
 
             action act = action::NONE;
             if (raw->mask & IN_CREATE)
